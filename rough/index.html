@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>WebSocket + Streaming Test</title>
+</head>
+
+<body>
+
+    <h1>Streaming Test</h1>
+
+    <h2>Audio</h2>
+
+    <audio controls>
+        <source src="/stream" type="audio/mpeg">
+        Your browser does not support audio.
+    </audio>
+
+      <h2>WebSocket</h2>
+
+    <button id="connect">Connect</button>
+    <button id="send">Send Message</button>
+
+    <p id="status">Disconnected</p>
+
+  <script>
+        let ws;
+
+        const status = document.getElementById("status");
+
+        document.getElementById("connect").onclick = () => {
+
+            ws = new WebSocket("wss://anipa.serveousercontent.com");
+
+            ws.onopen = () => {
+                status.textContent = "Connected";
+                console.log("WebSocket connected");
+            };
+
+            ws.onmessage = (event) => {
+                console.log("Server:", event.data);
+                status.textContent = "Server: " + event.data;
+            };
+
+            ws.onclose = () => {
+                status.textContent = "Disconnected";
+                console.log("WebSocket disconnected");
+            };
+
+            ws.onerror = (error) => {
+                console.log("WebSocket error:", error);
+            };
+        };
+
+        document.getElementById("send").onclick = () => {
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send("Hello server!");
+            } else {
+                console.log("WebSocket is not connected");
+            }
+
+        };
+    </script>
+  
+</body>
+</html>
