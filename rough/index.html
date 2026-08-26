@@ -2,66 +2,163 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>WebSocket + Streaming Test</title>
+    <title>Spotify Jam Test</title>
 </head>
 
 <body>
+    <h1>Spotify Jam Test</h1>
 
-    <h1>Streaming Test</h1>
-
-    <h2>Audio</h2>
-
-    <audio controls>
+    <audio id="audio" preload="auto">
         <source src="/stream" type="audio/mpeg">
         Your browser does not support audio.
     </audio>
 
-      <h2>WebSocket</h2>
+    <br><br>
 
-    <button id="connect">Connect</button>
-    <button id="send">Send Message</button>
+    <button id="play">Play</button>
+    <button id="pause">Pause</button>
 
-    <p id="status">Disconnected</p>
+    <br><br>
 
-  <script>
-        let ws;
+    <input id="seek" type="range" min="0" max="100" value="0" step="0.1">
 
+    <p id="status">Connecting...</p>
+    <p id="position">Position: 0.00</p>
+
+    <script>
+        const audio = document.getElementById("audio");
+        const playButton = document.getElementById("play");
+        const pauseButton = document.getElementById("pause");
+        const seek = document.getElementById("seek");
         const status = document.getElementById("status");
+        const positionText = document.getElementById("position");
 
-        document.getElementById("connect").onclick = () => {
+        // Same page works locally and through HTTPS/Serveo.
+        const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+        const ws = new WebSocket(`${wsProtocol}//${location.host}`);
 
-            ws = new WebSocket("wss://anipa.serveousercontent.com");
+        let applyingServerState = false;
+        let lastServerState = null;
 
-            ws.onopen = () => {
-                status.textContent = "Connected";
-                console.log("WebSocket connected");
-            };
-
-            ws.onmessage = (event) => {
-                console.log("Server:", event.data);
-                status.textContent = "Server: " + event.data;
-            };
-
-            ws.onclose = () => {
-                status.textContent = "Disconnected";
-                console.log("WebSocket disconnected");
-            };
-
-            ws.onerror = (error) => {
-                console.log("WebSocket error:", error);
-            };
+        ws.onopen = () => {
+            console.log("WebSocket connected");
+            status.textContent = "Connected";
         };
 
-        document.getElementById("send").onclick = () => {
+        ws.onmessage = async (event) => {
+            const state = JSON.parse(event.data);
 
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send("Hello server!");
-            } else {
-                console.log("WebSocket is not connected");
+            if (state.type !== "state") return;
+
+            console.log("SERVER STATE:", state);
+            lastServerState = state;
+
+            let position = state.position;
+
+            // Account for the time between the server creating the
+            // message and this browser receiving it.
+            if (state.status === "playing") {
+                position += (Date.now() - state.serverTime) / 1000;
             }
 
+            if (!Number.isFinite(position)) return;
+
+            applyingServerState = true;
+
+            try {
+                // Wait until the audio metadata exists before seeking.
+                if (audio.readyState >= 1) {
+                    audio.currentTime = position;
+                }
+
+                if (state.status === "playing") {
+                    try {
+                        await audio.play();
+                    } catch (error) {
+                        console.log("Play blocked by browser:", error);
+                        status.textContent = "Connected — click Play once to allow audio";
+                    }
+                } else {
+                    audio.pause();
+                }
+            } finally {
+                applyingServerState = false;
+            }
+
+            status.textContent = "Server: " + state.status;
+            positionText.textContent = "Position: " + position.toFixed(2);
+        };
+
+        playButton.onclick = () => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+
+            console.log("Sending PLAY");
+            ws.send(JSON.stringify({ type: "play" }));
+        };
+
+        pauseButton.onclick = () => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+
+            console.log("Sending PAUSE");
+            ws.send(JSON.stringify({ type: "pause" }));
+        };
+
+        seek.onchange = () => {
+            if (ws.readyState !== WebSocket.OPEN) return;
+
+            const position = Number(seek.value);
+
+            console.log("Sending SEEK:", position);
+            ws.send(JSON.stringify({
+                type: "seek",
+                position
+            }));
+        };
+
+        audio.addEventListener("loadedmetadata", () => {
+            console.log("Audio duration:", audio.duration);
+            seek.max = audio.duration;
+
+            // If the server was already playing before metadata loaded,
+            // apply that state now.
+            if (lastServerState) {
+                const state = lastServerState;
+                let position = state.position;
+
+                if (state.status === "playing") {
+                    position += (Date.now() - state.serverTime) / 1000;
+                }
+
+                applyingServerState = true;
+                audio.currentTime = position;
+                applyingServerState = false;
+
+                if (state.status === "playing") {
+                    audio.play().catch((error) => {
+                        console.log("Play blocked by browser:", error);
+                    });
+                }
+            }
+        });
+
+        audio.addEventListener("timeupdate", () => {
+            if (!audio.duration) return;
+
+            seek.max = audio.duration;
+            seek.value = audio.currentTime;
+            positionText.textContent =
+                "Position: " + audio.currentTime.toFixed(2);
+        });
+
+        ws.onerror = (error) => {
+            console.log("WebSocket error:", error);
+            status.textContent = "WebSocket error";
+        };
+
+        ws.onclose = () => {
+            console.log("WebSocket disconnected");
+            status.textContent = "Disconnected";
         };
     </script>
-  
 </body>
 </html>
