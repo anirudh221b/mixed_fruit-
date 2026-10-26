@@ -24,7 +24,7 @@ app.get("/hello", (req, res) => {
 
 app.get("/stream", (req, res) => {
 
-    const stream = fs.createReadStream("./song.mp3");
+    const stream = fs.createReadStream("./song_db/veera.mp3");
 
     res.setHeader("Content-Type", "audio/mpeg");
 
