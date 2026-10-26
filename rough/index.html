@@ -1,164 +1,302 @@
+
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Jam Test</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Synced Music Player</title>
+
+    <style>
+        body {
+            background: #111;
+            color: white;
+            font-family: Arial, sans-serif;
+            text-align: center;
+            padding: 30px;
+        }
+
+        button {
+            padding: 10px 20px;
+            margin: 8px;
+            cursor: pointer;
+        }
+
+        #seek {
+            width: min(500px, 90%);
+            margin: 20px;
+        }
+
+        #status {
+            color: #aaa;
+        }
+    </style>
 </head>
 
 <body>
-    <h1>Spotify Jam Test</h1>
+    <h1>Synced Music Player</h1>
 
     <audio id="audio" preload="auto">
         <source src="/stream" type="audio/mpeg">
         Your browser does not support audio.
     </audio>
 
-    <br><br>
+    <div>
+        <button id="play">Play</button>
+        <button id="pause">Pause</button>
+    </div>
 
-    <button id="play">Play</button>
-    <button id="pause">Pause</button>
+    <div>
+        <input
+            id="seek"
+            type="range"
+            min="0"
+            max="100"
+            value="0"
+            step="0.1"
+        >
 
-    <br><br>
-
-    <input id="seek" type="range" min="0" max="100" value="0" step="0.1">
+        <p id="time">0:00 / 0:00</p>
+    </div>
 
     <p id="status">Connecting...</p>
-    <p id="position">Position: 0.00</p>
 
     <script>
         const audio = document.getElementById("audio");
         const playButton = document.getElementById("play");
         const pauseButton = document.getElementById("pause");
         const seek = document.getElementById("seek");
+        const time = document.getElementById("time");
         const status = document.getElementById("status");
-        const positionText = document.getElementById("position");
 
-        // Same page works locally and through HTTPS/Serveo.
-        const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
-        const ws = new WebSocket(`${wsProtocol}//${location.host}`);
+        // Automatically use WSS for HTTPS tunnel URLs.
+        const protocol =
+            location.protocol === "https:" ? "wss:" : "ws:";
 
-        let applyingServerState = false;
-        let lastServerState = null;
+        const ws = new WebSocket(
+            `${protocol}//${location.host}`
+        );
 
-        ws.onopen = () => {
-            console.log("WebSocket connected");
-            status.textContent = "Connected";
-        };
+        let latestState = null;
+        let applyingState = false;
+        let firstSync = true;
+        let isSeeking = false;
 
-        ws.onmessage = async (event) => {
-            const state = JSON.parse(event.data);
+        // -------------------------
+        // WebSocket commands
+        // -------------------------
 
-            if (state.type !== "state") return;
+        function sendCommand(command) {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(command));
+            }
+        }
 
-            console.log("SERVER STATE:", state);
-            lastServerState = state;
+        // -------------------------
+        // Time display
+        // -------------------------
 
-            let position = state.position;
-
-            // Account for the time between the server creating the
-            // message and this browser receiving it.
-            if (state.status === "playing") {
-                position += (Date.now() - state.serverTime) / 1000;
+        function formatTime(seconds) {
+            if (!Number.isFinite(seconds) || seconds < 0) {
+                seconds = 0;
             }
 
-            if (!Number.isFinite(position)) return;
+            const minutes = Math.floor(seconds / 60);
+            const remainingSeconds = Math.floor(seconds % 60);
 
-            applyingServerState = true;
+            return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
+        }
+
+        function updateTime() {
+            const duration = Number.isFinite(audio.duration)
+                ? audio.duration
+                : 0;
+
+            if (!isSeeking && duration > 0) {
+                seek.max = duration;
+                seek.value = audio.currentTime;
+            }
+
+            time.textContent =
+                `${formatTime(audio.currentTime)} / ` +
+                `${formatTime(duration)}`;
+        }
+
+        // -------------------------
+        // Synchronize local player
+        // -------------------------
+
+        async function applyLatestState() {
+            if (applyingState) return;
+
+            applyingState = true;
 
             try {
-                // Wait until the audio metadata exists before seeking.
-                if (audio.readyState >= 1) {
-                    audio.currentTime = position;
-                }
+                while (latestState) {
+                    const state = latestState;
+                    latestState = null;
 
-                if (state.status === "playing") {
-                    try {
-                        await audio.play();
-                    } catch (error) {
-                        console.log("Play blocked by browser:", error);
-                        status.textContent = "Connected — click Play once to allow audio";
+                    if (state.type !== "state") continue;
+
+                    // Wait for audio metadata before seeking.
+                    if (audio.readyState < 1) {
+                        await new Promise((resolve) => {
+                            audio.addEventListener(
+                                "loadedmetadata",
+                                resolve,
+                                { once: true }
+                            );
+
+                            audio.addEventListener(
+                                "error",
+                                resolve,
+                                { once: true }
+                            );
+                        });
                     }
-                } else {
-                    audio.pause();
+
+                    if (audio.error) continue;
+
+                    // Calculate the position the song should be at now.
+                    let target = Number(state.position) || 0;
+
+                    if (
+                        state.status === "playing" &&
+                        Number.isFinite(state.serverTime)
+                    ) {
+                        target += Math.max(
+                            0,
+                            (Date.now() - state.serverTime) / 1000
+                        );
+                    }
+
+                    if (
+                        Number.isFinite(audio.duration) &&
+                        audio.duration > 0
+                    ) {
+                        target = Math.min(target, audio.duration);
+                    }
+
+                    const drift = Math.abs(
+                        audio.currentTime - target
+                    );
+
+                    // First state: always pause and seek.
+                    // Later states: correct only significant drift.
+                    const mustSync = firstSync || drift > 0.35;
+
+                    if (mustSync) {
+                        audio.pause();
+                        audio.currentTime = target;
+                    }
+
+                    // First synchronization is done.
+                    firstSync = false;
+
+                    // Match the server's playback status.
+                    if (state.status === "playing") {
+                        try {
+                            await audio.play();
+                            status.textContent = "Connected — Playing";
+                        } catch (error) {
+                            status.textContent =
+                                "Connected — click Play to start audio";
+
+                            console.warn(
+                                "Browser blocked playback:",
+                                error
+                            );
+                        }
+                    } else {
+                        audio.pause();
+                        status.textContent = "Connected — Paused";
+                    }
+
+                    updateTime();
                 }
             } finally {
-                applyingServerState = false;
-            }
+                applyingState = false;
 
-            status.textContent = "Server: " + state.status;
-            positionText.textContent = "Position: " + position.toFixed(2);
-        };
-
-        playButton.onclick = () => {
-            if (ws.readyState !== WebSocket.OPEN) return;
-
-            console.log("Sending PLAY");
-            ws.send(JSON.stringify({ type: "play" }));
-        };
-
-        pauseButton.onclick = () => {
-            if (ws.readyState !== WebSocket.OPEN) return;
-
-            console.log("Sending PAUSE");
-            ws.send(JSON.stringify({ type: "pause" }));
-        };
-
-        seek.onchange = () => {
-            if (ws.readyState !== WebSocket.OPEN) return;
-
-            const position = Number(seek.value);
-
-            console.log("Sending SEEK:", position);
-            ws.send(JSON.stringify({
-                type: "seek",
-                position
-            }));
-        };
-
-        audio.addEventListener("loadedmetadata", () => {
-            console.log("Audio duration:", audio.duration);
-            seek.max = audio.duration;
-
-            // If the server was already playing before metadata loaded,
-            // apply that state now.
-            if (lastServerState) {
-                const state = lastServerState;
-                let position = state.position;
-
-                if (state.status === "playing") {
-                    position += (Date.now() - state.serverTime) / 1000;
-                }
-
-                applyingServerState = true;
-                audio.currentTime = position;
-                applyingServerState = false;
-
-                if (state.status === "playing") {
-                    audio.play().catch((error) => {
-                        console.log("Play blocked by browser:", error);
-                    });
+                // Process any newer state received during an async operation.
+                if (latestState) {
+                    void applyLatestState();
                 }
             }
-        });
+        }
 
-        audio.addEventListener("timeupdate", () => {
-            if (!audio.duration) return;
+        // -------------------------
+        // WebSocket events
+        // -------------------------
 
-            seek.max = audio.duration;
-            seek.value = audio.currentTime;
-            positionText.textContent =
-                "Position: " + audio.currentTime.toFixed(2);
-        });
+        ws.onopen = () => {
+            status.textContent = "Connected — waiting for state";
+            console.log("WebSocket connected");
+        };
 
-        ws.onerror = (error) => {
-            console.log("WebSocket error:", error);
-            status.textContent = "WebSocket error";
+        ws.onmessage = (event) => {
+            try {
+                latestState = JSON.parse(event.data);
+                void applyLatestState();
+            } catch (error) {
+                console.error("Invalid server message:", error);
+            }
         };
 
         ws.onclose = () => {
-            console.log("WebSocket disconnected");
             status.textContent = "Disconnected";
+            console.log("WebSocket disconnected");
         };
+
+        ws.onerror = (error) => {
+            status.textContent = "WebSocket error";
+            console.error("WebSocket error:", error);
+        };
+
+        // -------------------------
+        // User controls
+        // -------------------------
+
+        playButton.addEventListener("click", () => {
+            // Start immediately from the user's gesture.
+            audio.play().catch((error) => {
+                console.warn("Playback failed:", error);
+            });
+
+            sendCommand({ type: "play" });
+        });
+
+        pauseButton.addEventListener("click", () => {
+            sendCommand({ type: "pause" });
+        });
+
+        seek.addEventListener("input", () => {
+            isSeeking = true;
+
+            time.textContent =
+                `${formatTime(Number(seek.value))} / ` +
+                `${formatTime(audio.duration)}`;
+        });
+
+        seek.addEventListener("change", () => {
+            const position = Number(seek.value);
+
+            isSeeking = false;
+
+            // Update locally immediately.
+            audio.currentTime = position;
+
+            // The server broadcasts the new position to every client.
+            sendCommand({
+                type: "seek",
+                position
+            });
+        });
+
+        // Keep the displayed position updated.
+        audio.addEventListener("timeupdate", updateTime);
+        audio.addEventListener("loadedmetadata", updateTime);
+        audio.addEventListener("durationchange", updateTime);
     </script>
 </body>
 </html>
+

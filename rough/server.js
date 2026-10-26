@@ -1,54 +1,64 @@
+
 const express = require("express");
 const http = require("http");
-const { WebSocketServer, WebSocket } = require("ws");
 const fs = require("fs");
+const path = require("path");
+const { WebSocketServer, WebSocket } = require("ws");
 
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
-app.use(express.static("."));
+const PORT = 3000;
+const SONG_PATH = path.join(__dirname,"song_db","veera.mp3");
 
-// ==========================================
-// EXPRESS ROUTES
-// ==========================================
+app.use(express.static(__dirname));
 
-app.get("/hello", (req, res) => {
-    res.json({
-        message: "Hello from Express"
-    });
+// -------------------------
+// HTTP routes
+// -------------------------
+
+app.get("/", (req, res) => {
+    res.sendFile(path.join(__dirname, "index.html"));
 });
 
+app.get("/hello", (req, res) => {
+    res.json({ message: "Hello from Express" });
+});
 
-// ==========================================
-// AUDIO STREAM
-// ==========================================
-
+// Stream audio over HTTP
 app.get("/stream", (req, res) => {
-
-    const stream = fs.createReadStream("./song_db/veera.mp3");
+    if (!fs.existsSync(SONG_PATH)) {
+        return res.status(404).send("song.mp3 not found");
+    }
 
     res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "no-cache");
+
+    const stream = fs.createReadStream(SONG_PATH);
+
+    stream.on("error", (error) => {
+        console.error("Audio stream error:", error.message);
+
+        if (!res.headersSent) {
+            res.status(500).end("Unable to stream audio");
+        } else {
+            res.destroy(error);
+        }
+    });
+
+    res.on("close", () => {
+        if (!stream.destroyed) {
+            stream.destroy();
+        }
+    });
 
     stream.pipe(res);
 });
 
-
-// ==========================================
-// HTTP SERVER
-// ==========================================
-
-const server = http.createServer(app);
-
-
-// ==========================================
-// WEBSOCKET SERVER
-// ==========================================
-
-const wss = new WebSocketServer({ server });
-
-
-// ==========================================
-// SHARED SONG STATE
-// ==========================================
+// -------------------------
+// Shared playback state
+// -------------------------
 
 let songState = {
     status: "paused",
@@ -56,183 +66,101 @@ let songState = {
     updatedAt: Date.now()
 };
 
-
-// ==========================================
-// GET CURRENT SONG POSITION
-// ==========================================
-
 function getCurrentPosition() {
-
     if (songState.status === "paused") {
         return songState.position;
     }
 
-    const elapsed =
+    return songState.position +
         (Date.now() - songState.updatedAt) / 1000;
-
-    return songState.position + elapsed;
 }
 
-
-// ==========================================
-// BROADCAST STATE TO ALL CLIENTS
-// ==========================================
-
-function broadcastState() {
-
-    const state = {
+function getStateMessage() {
+    return {
         type: "state",
         status: songState.status,
         position: getCurrentPosition(),
         serverTime: Date.now()
     };
+}
 
-    const message = JSON.stringify(state);
+function broadcastState() {
+    const message = JSON.stringify(getStateMessage());
 
-    wss.clients.forEach((client) => {
-
+    for (const client of wss.clients) {
         if (client.readyState === WebSocket.OPEN) {
             client.send(message);
         }
+    }
 
-    });
+    console.log("Broadcast:", message);
 }
 
-
-// ==========================================
-// WEBSOCKET CONNECTION
-// ==========================================
+// -------------------------
+// WebSocket server
+// -------------------------
 
 wss.on("connection", (ws) => {
+    console.log("Client connected. Total:", wss.clients.size);
 
-    console.log("Client connected");
+    // Send current state only to the newcomer.
+    // Do not broadcast a connection event to existing clients.
+    ws.send(JSON.stringify(getStateMessage()));
 
-
-    // --------------------------------------
-    // Send current state to new client
-    // --------------------------------------
-
-    ws.send(JSON.stringify({
-        type: "state",
-        status: songState.status,
-        position: getCurrentPosition(),
-        serverTime: Date.now()
-    }));
-
-
-    // --------------------------------------
-    // Receive messages
-    // --------------------------------------
-
-    ws.on("message", (message) => {
-
+    ws.on("message", (rawMessage) => {
         let data;
 
         try {
-            data = JSON.parse(message.toString());
-        }
-        catch (error) {
-            console.log("Invalid JSON");
+            data = JSON.parse(rawMessage.toString());
+        } catch {
+            console.log("Ignoring invalid JSON");
             return;
         }
 
         console.log("Received:", data);
 
-
-        // ==================================
-        // PLAY
-        // ==================================
-
         if (data.type === "play") {
-
-            // Already playing
-            if (songState.status === "playing") {
-                return;
+            if (songState.status !== "playing") {
+                songState.position = getCurrentPosition();
+                songState.status = "playing";
+                songState.updatedAt = Date.now();
             }
-
-            songState.position =
-                getCurrentPosition();
-
-            songState.status = "playing";
-
-            songState.updatedAt =
-                Date.now();
-
-            broadcastState();
-        }
-
-
-        // ==================================
-        // PAUSE
-        // ==================================
-
-        else if (data.type === "pause") {
-
-            // Already paused
-            if (songState.status === "paused") {
-                return;
+        } else if (data.type === "pause") {
+            if (songState.status !== "paused") {
+                songState.position = getCurrentPosition();
+                songState.status = "paused";
+                songState.updatedAt = Date.now();
             }
+        } else if (data.type === "seek") {
+            const position = Number(data.position);
 
-            songState.position =
-                getCurrentPosition();
-
-            songState.status = "paused";
-
-            songState.updatedAt =
-                Date.now();
-
-            broadcastState();
-        }
-
-
-        // ==================================
-        // SEEK
-        // ==================================
-
-        else if (data.type === "seek") {
-
-            const position =
-                Number(data.position);
-
-            if (
-                Number.isNaN(position) ||
-                position < 0
-            ) {
+            if (!Number.isFinite(position) || position < 0) {
                 return;
             }
 
             songState.position = position;
-
-            songState.updatedAt =
-                Date.now();
-
-            broadcastState();
+            songState.updatedAt = Date.now();
+        } else {
+            return;
         }
 
+        broadcastState();
     });
-
-
-    // ======================================
-    // CLIENT DISCONNECTED
-    // ======================================
 
     ws.on("close", () => {
-
-        console.log("Client disconnected");
-
+        console.log("Client disconnected. Total:", wss.clients.size - 1);
     });
 
+    ws.on("error", (error) => {
+        console.error("WebSocket error:", error.message);
+    });
 });
 
+// -------------------------
+// Start server
+// -------------------------
 
-// ==========================================
-// START SERVER
-// ==========================================
-
-server.listen(3000, () => {
-
-    console.log(
-        "Server running on http://localhost:3000"
-    );
-
+server.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
 });
+
