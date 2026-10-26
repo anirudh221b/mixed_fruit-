@@ -4,7 +4,6 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
     <title>Synced Music Player</title>
 
     <style>
@@ -16,10 +15,31 @@
             padding: 30px;
         }
 
+        input {
+            box-sizing: border-box;
+            max-width: 500px;
+            width: 90%;
+            padding: 10px;
+            margin: 5px;
+        }
+
         button {
-            padding: 10px 20px;
-            margin: 8px;
+            background: #292929;
+            color: white;
+            border: 1px solid #555;
+            border-radius: 6px;
+            padding: 10px 16px;
+            margin: 6px;
             cursor: pointer;
+        }
+
+        button:hover {
+            background: #444;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
         }
 
         #seek {
@@ -27,8 +47,29 @@
             margin: 20px;
         }
 
+        #songList {
+            list-style: none;
+            padding: 0;
+            max-width: 600px;
+            margin: 20px auto;
+        }
+
+        #songList li {
+            margin: 8px 0;
+        }
+
+        #songList button {
+            width: 100%;
+            text-align: left;
+            overflow-wrap: anywhere;
+        }
+
         #status {
             color: #aaa;
+        }
+
+        #nowPlaying {
+            color: #8f8;
         }
     </style>
 </head>
@@ -36,10 +77,10 @@
 <body>
     <h1>Synced Music Player</h1>
 
-    <audio id="audio" preload="auto">
-        <source src="/stream" type="audio/mpeg">
-        Your browser does not support audio.
-    </audio>
+    <h2>Now Playing</h2>
+    <p id="nowPlaying">No song selected</p>
+
+    <audio id="audio" preload="auto"></audio>
 
     <div>
         <button id="play">Play</button>
@@ -55,9 +96,47 @@
             value="0"
             step="0.1"
         >
-
         <p id="time">0:00 / 0:00</p>
     </div>
+
+    <hr>
+
+    <h2>Add a Song from YouTube</h2>
+
+    <form id="addSongForm">
+        <div>
+            <input
+                id="youtubeUrl"
+                type="url"
+                placeholder="Paste YouTube URL"
+                required
+            >
+        </div>
+
+        <div>
+            <input
+                id="songName"
+                type="text"
+                placeholder="Custom name (without .mp3)"
+                maxlength="80"
+                pattern="[a-zA-Z0-9][a-zA-Z0-9 _-]{0,79}"
+                title="Use letters, numbers, spaces, underscores and hyphens."
+                required
+            >
+        </div>
+
+        <button type="submit" id="downloadButton">
+            Download &amp; Add
+        </button>
+    </form>
+
+    <p id="downloadStatus"></p>
+
+    <hr>
+
+    <h2>Available Songs</h2>
+    <button id="listSongs">List Songs</button>
+    <ul id="songList"></ul>
 
     <p id="status">Connecting...</p>
 
@@ -68,27 +147,37 @@
         const seek = document.getElementById("seek");
         const time = document.getElementById("time");
         const status = document.getElementById("status");
+        const nowPlaying = document.getElementById("nowPlaying");
+        const songList = document.getElementById("songList");
+        const listSongsButton = document.getElementById("listSongs");
 
-        // Automatically use WSS for HTTPS tunnel URLs.
+        const addSongForm = document.getElementById("addSongForm");
+        const youtubeUrlInput = document.getElementById("youtubeUrl");
+        const songNameInput = document.getElementById("songName");
+        const downloadButton = document.getElementById("downloadButton");
+        const downloadStatus = document.getElementById("downloadStatus");
+
         const protocol =
             location.protocol === "https:" ? "wss:" : "ws:";
 
-        const ws = new WebSocket(
-            `${protocol}//${location.host}`
-        );
+        const ws = new WebSocket(`${protocol}//${location.host}`);
 
         let latestState = null;
         let applyingState = false;
         let firstSync = true;
         let isSeeking = false;
+        let selectedSong = null;
+        let loadGeneration = 0;
 
         // -------------------------
-        // WebSocket commands
+        // Send commands
         // -------------------------
 
         function sendCommand(command) {
             if (ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify(command));
+            } else {
+                status.textContent = "WebSocket is not connected.";
             }
         }
 
@@ -118,12 +207,132 @@
             }
 
             time.textContent =
-                `${formatTime(audio.currentTime)} / ` +
-                `${formatTime(duration)}`;
+                `${formatTime(audio.currentTime)} / ${formatTime(duration)}`;
         }
 
         // -------------------------
-        // Synchronize local player
+        // Request and display songs
+        // -------------------------
+
+        listSongsButton.addEventListener("click", () => {
+            songList.replaceChildren();
+
+            if (ws.readyState !== WebSocket.OPEN) {
+                songList.textContent = "WebSocket is not connected.";
+                return;
+            }
+
+            const item = document.createElement("li");
+            item.textContent = "Loading songs...";
+            songList.appendChild(item);
+
+            sendCommand({ type: "listSongs" });
+        });
+
+        function displaySongList(data) {
+            songList.replaceChildren();
+
+            if (data.error) {
+                songList.textContent = data.error;
+                return;
+            }
+
+            if (!data.songs || data.songs.length === 0) {
+                songList.textContent = "No MP3 songs found in song_db.";
+                return;
+            }
+
+            for (const song of data.songs) {
+                const item = document.createElement("li");
+                const button = document.createElement("button");
+
+                button.textContent =
+                    song === selectedSong ? `▶ ${song}` : song;
+
+                button.addEventListener("click", () => {
+                    sendCommand({
+                        type: "selectSong",
+                        song
+                    });
+
+                    status.textContent = `Selecting ${song}...`;
+                });
+
+                item.appendChild(button);
+                songList.appendChild(item);
+            }
+        }
+
+        // -------------------------
+        // Add YouTube song
+        // -------------------------
+
+        addSongForm.addEventListener("submit", (event) => {
+            event.preventDefault();
+
+            if (!addSongForm.reportValidity()) return;
+
+            if (ws.readyState !== WebSocket.OPEN) {
+                downloadStatus.textContent = "WebSocket is not connected.";
+                return;
+            }
+
+            downloadButton.disabled = true;
+            downloadStatus.style.color = "#aaa";
+            downloadStatus.textContent = "Sending download request...";
+
+            sendCommand({
+                type: "addSong",
+                url: youtubeUrlInput.value.trim(),
+                name: songNameInput.value.trim()
+            });
+        });
+
+        // -------------------------
+        // Load song
+        // -------------------------
+
+        function loadSong(song) {
+            const generation = ++loadGeneration;
+
+            return new Promise((resolve) => {
+                let finished = false;
+
+                const cleanup = () => {
+                    audio.removeEventListener("loadedmetadata", onLoaded);
+                    audio.removeEventListener("error", onError);
+                };
+
+                const finish = (success) => {
+                    if (finished) return;
+                    finished = true;
+                    cleanup();
+
+                    resolve({
+                        success,
+                        generation
+                    });
+                };
+
+                const onLoaded = () => finish(true);
+                const onError = () => finish(false);
+
+                audio.addEventListener("loadedmetadata", onLoaded);
+                audio.addEventListener("error", onError);
+
+                audio.src =
+                    `/stream?file=${encodeURIComponent(song)}`;
+
+                audio.load();
+
+                if (audio.readyState >= 1) {
+                    finish(true);
+                }
+            });
+        }
+
+        // -------------------------
+        // Apply server state
         // -------------------------
 
         async function applyLatestState() {
@@ -137,27 +346,34 @@
                     latestState = null;
 
                     if (state.type !== "state") continue;
+                    if (typeof state.song !== "string") continue;
 
-                    // Wait for audio metadata before seeking.
-                    if (audio.readyState < 1) {
-                        await new Promise((resolve) => {
-                            audio.addEventListener(
-                                "loadedmetadata",
-                                resolve,
-                                { once: true }
-                            );
+                    // Switch track if the server-selected song changed.
+                    if (selectedSong !== state.song) {
+                        audio.pause();
 
-                            audio.addEventListener(
-                                "error",
-                                resolve,
-                                { once: true }
-                            );
-                        });
+                        selectedSong = state.song;
+                        firstSync = true;
+
+                        nowPlaying.textContent = state.song;
+                        status.textContent = `Loading ${state.song}...`;
+
+                        const result = await loadSong(state.song);
+
+                        // Ignore stale async results if a newer load started.
+                        if (result.generation !== loadGeneration) continue;
+
+                        if (!result.success) {
+                            status.textContent =
+                                `Could not load ${state.song}`;
+                            continue;
+                        }
+
+                        if (latestState) continue;
                     }
 
-                    if (audio.error) continue;
+                    if (audio.readyState < 1) continue;
 
-                    // Calculate the position the song should be at now.
                     let target = Number(state.position) || 0;
 
                     if (
@@ -177,35 +393,26 @@
                         target = Math.min(target, audio.duration);
                     }
 
-                    const drift = Math.abs(
-                        audio.currentTime - target
-                    );
-
-                    // First state: always pause and seek.
-                    // Later states: correct only significant drift.
+                    const drift = Math.abs(audio.currentTime - target);
                     const mustSync = firstSync || drift > 0.35;
 
                     if (mustSync) {
+                        // First sync/new track: pause, seek, then play.
                         audio.pause();
                         audio.currentTime = target;
                     }
 
-                    // First synchronization is done.
                     firstSync = false;
 
-                    // Match the server's playback status.
                     if (state.status === "playing") {
                         try {
                             await audio.play();
                             status.textContent = "Connected — Playing";
                         } catch (error) {
                             status.textContent =
-                                "Connected — click Play to start audio";
+                                "Playback blocked. Click Play to start.";
 
-                            console.warn(
-                                "Browser blocked playback:",
-                                error
-                            );
+                            console.warn("Playback blocked:", error);
                         }
                     } else {
                         audio.pause();
@@ -213,14 +420,23 @@
                     }
 
                     updateTime();
+                    displayCurrentSongMarker();
                 }
             } finally {
                 applyingState = false;
 
-                // Process any newer state received during an async operation.
                 if (latestState) {
                     void applyLatestState();
                 }
+            }
+        }
+
+        function displayCurrentSongMarker() {
+            for (const button of songList.querySelectorAll("button")) {
+                const song = button.textContent.replace(/^▶ /, "");
+
+                button.textContent =
+                    song === selectedSong ? `▶ ${song}` : song;
             }
         }
 
@@ -229,35 +445,69 @@
         // -------------------------
 
         ws.onopen = () => {
-            status.textContent = "Connected — waiting for state";
-            console.log("WebSocket connected");
+            status.textContent = "Connected";
         };
 
         ws.onmessage = (event) => {
+            let data;
+
             try {
-                latestState = JSON.parse(event.data);
-                void applyLatestState();
+                data = JSON.parse(event.data);
             } catch (error) {
                 console.error("Invalid server message:", error);
+                return;
+            }
+
+            if (data.type === "songList") {
+                displaySongList(data);
+                return;
+            }
+
+            if (data.type === "downloadResult") {
+                downloadStatus.textContent = data.message;
+
+                if (data.success === false) {
+                    downloadStatus.style.color = "#f77";
+                } else if (data.success === true) {
+                    downloadStatus.style.color = "#8f8";
+                } else {
+                    downloadStatus.style.color = "#aaa";
+                }
+
+                if (data.success !== null) {
+                    downloadButton.disabled = false;
+                }
+
+                return;
+            }
+
+            if (data.type === "error") {
+                status.textContent = data.message;
+                return;
+            }
+
+            if (data.type === "state") {
+                latestState = data;
+                void applyLatestState();
             }
         };
 
         ws.onclose = () => {
             status.textContent = "Disconnected";
-            console.log("WebSocket disconnected");
+            downloadButton.disabled = false;
         };
 
         ws.onerror = (error) => {
-            status.textContent = "WebSocket error";
             console.error("WebSocket error:", error);
+            status.textContent = "WebSocket error";
         };
 
         // -------------------------
-        // User controls
+        // Playback controls
         // -------------------------
 
         playButton.addEventListener("click", () => {
-            // Start immediately from the user's gesture.
+            // Immediate attempt in the user's click gesture.
             audio.play().catch((error) => {
                 console.warn("Playback failed:", error);
             });
@@ -273,26 +523,21 @@
             isSeeking = true;
 
             time.textContent =
-                `${formatTime(Number(seek.value))} / ` +
-                `${formatTime(audio.duration)}`;
+                `${formatTime(Number(seek.value))} / ${formatTime(audio.duration)}`;
         });
 
         seek.addEventListener("change", () => {
             const position = Number(seek.value);
-
             isSeeking = false;
 
-            // Update locally immediately.
             audio.currentTime = position;
 
-            // The server broadcasts the new position to every client.
             sendCommand({
                 type: "seek",
                 position
             });
         });
 
-        // Keep the displayed position updated.
         audio.addEventListener("timeupdate", updateTime);
         audio.addEventListener("loadedmetadata", updateTime);
         audio.addEventListener("durationchange", updateTime);
