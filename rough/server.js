@@ -15,7 +15,7 @@ const SONG_DIR = path.join(__dirname, "song_db");
 const YT_SCRIPT = path.join(__dirname, "yt.sh");
 const DEFAULT_SONG = "song.mp3";
 
-// Do not expose song_db files through static hosting.
+// Do not expose song_db through static hosting.
 app.use((req, res, next) => {
     if (req.path.startsWith("/song_db/")) {
         return res.sendStatus(404);
@@ -37,7 +37,6 @@ app.get("/hello", (req, res) => {
     res.json({ message: "Hello from Express" });
 });
 
-// Validate a filename against the song directory.
 function getSongPath(filename) {
     if (
         typeof filename !== "string" ||
@@ -49,15 +48,10 @@ function getSongPath(filename) {
 
     try {
         const fullPath = path.join(SONG_DIR, filename);
-
-        if (fs.statSync(fullPath).isFile()) {
-            return fullPath;
-        }
+        return fs.statSync(fullPath).isFile() ? fullPath : null;
     } catch {
-        // File missing or inaccessible.
+        return null;
     }
-
-    return null;
 }
 
 // -------------------------
@@ -133,7 +127,6 @@ app.get("/stream", (req, res) => {
         res.setHeader("Content-Length", end - start + 1);
 
         const stream = fs.createReadStream(songPath, { start, end });
-
         res.on("close", () => stream.destroy());
         stream.on("error", (error) => {
             console.error("Audio stream error:", error.message);
@@ -146,7 +139,6 @@ app.get("/stream", (req, res) => {
     res.setHeader("Content-Length", fileSize);
 
     const stream = fs.createReadStream(songPath);
-
     res.on("close", () => stream.destroy());
     stream.on("error", (error) => {
         console.error("Audio stream error:", error.message);
@@ -181,10 +173,7 @@ function sendSongList(ws) {
             .map(entry => entry.name)
             .sort((a, b) => a.localeCompare(b));
 
-        ws.send(JSON.stringify({
-            type: "songList",
-            songs
-        }));
+        ws.send(JSON.stringify({ type: "songList", songs }));
     });
 }
 
@@ -228,20 +217,19 @@ function broadcastState() {
     }
 }
 
-// -------------------------
-// YouTube download
-// -------------------------
-
-const activeDownloads = new Set();
-
 function sendToClient(ws, message) {
     if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(message));
     }
 }
 
+// -------------------------
+// YouTube download
+// -------------------------
+
+const activeDownloads = new Set();
+
 function handleAddSong(ws, data) {
-    const url = data.url;
     const name = typeof data.name === "string"
         ? data.name.trim()
         : "";
@@ -250,7 +238,7 @@ function handleAddSong(ws, data) {
         sendToClient(ws, {
             type: "downloadResult",
             success: false,
-            message: "Invalid song name. Use letters, numbers, spaces, _ or -."
+            message: "Invalid name. Use letters, numbers, spaces, _ or -."
         });
         return;
     }
@@ -258,7 +246,7 @@ function handleAddSong(ws, data) {
     let parsedUrl;
 
     try {
-        parsedUrl = new URL(url);
+        parsedUrl = new URL(data.url);
     } catch {
         parsedUrl = null;
     }
@@ -287,7 +275,7 @@ function handleAddSong(ws, data) {
         sendToClient(ws, {
             type: "downloadResult",
             success: false,
-            message: "Enter a valid HTTPS YouTube video URL."
+            message: "Enter a valid HTTPS YouTube URL."
         });
         return;
     }
@@ -295,20 +283,11 @@ function handleAddSong(ws, data) {
     const filename = `${name}.mp3`;
     const outputPath = path.join(SONG_DIR, filename);
 
-    if (activeDownloads.has(filename)) {
+    if (activeDownloads.has(filename) || fs.existsSync(outputPath)) {
         sendToClient(ws, {
             type: "downloadResult",
             success: false,
-            message: "This song is already being downloaded."
-        });
-        return;
-    }
-
-    if (fs.existsSync(outputPath)) {
-        sendToClient(ws, {
-            type: "downloadResult",
-            success: false,
-            message: `${filename} already exists. Choose another name.`
+            message: "That filename already exists or is downloading."
         });
         return;
     }
@@ -321,8 +300,7 @@ function handleAddSong(ws, data) {
         message: `Downloading ${filename}...`
     });
 
-    // Run the existing script unchanged:
-    // ./yt.sh "URL" "Name.mp3"
+    // Keep yt.sh unchanged. Arguments are passed separately.
     execFile(
         YT_SCRIPT,
         [parsedUrl.href, filename],
@@ -336,7 +314,6 @@ function handleAddSong(ws, data) {
 
             if (error) {
                 console.error("yt.sh failed:", stderr || error.message);
-
                 sendToClient(ws, {
                     type: "downloadResult",
                     success: false,
@@ -347,12 +324,11 @@ function handleAddSong(ws, data) {
 
             console.log(stdout);
 
-            // Confirm that the expected MP3 actually exists.
             if (!getSongPath(filename)) {
                 sendToClient(ws, {
                     type: "downloadResult",
                     success: false,
-                    message: "Script finished, but the expected MP3 was not found."
+                    message: "The expected MP3 file was not found."
                 });
                 return;
             }
@@ -369,13 +345,11 @@ function handleAddSong(ws, data) {
 }
 
 // -------------------------
-// WebSocket server
+// WebSocket
 // -------------------------
 
 wss.on("connection", (ws) => {
     console.log("Client connected. Total:", wss.clients.size);
-
-    // Give the newcomer the current shared state.
     ws.send(JSON.stringify(getStateMessage()));
 
     ws.on("message", (rawMessage) => {
@@ -415,7 +389,6 @@ wss.on("connection", (ws) => {
             songState.status = "playing";
             songState.updatedAt = Date.now();
 
-            console.log("Selected song:", songState.song);
             broadcastState();
             return;
         }
